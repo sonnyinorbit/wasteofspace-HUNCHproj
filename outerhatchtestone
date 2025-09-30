@@ -3,8 +3,8 @@
 Servo hatchServo;
 const int servoPin = 9;
 const int closedAngle = 0;
-const int openAngle = 180; // Force full 180°
-const int startAngle = 180; // Start open instead of closed
+const int openAngle = 180;
+const int startAngle = 180; // Start open
 const int openTime = 2000;
 const int holdTime = 2000;
 const int stepDelay = 15;
@@ -13,9 +13,8 @@ void setup() {
   Serial.begin(9600);
   
   hatchServo.attach(servoPin);
-  
-  Serial.println("Calibrating servo to 180° (open) position...");
-  calibrateServo();
+  hatchServo.write(startAngle); // Set to open position immediately
+  delay(1000); // Brief delay to reach position
   
   executeAirlockCycle();
   
@@ -38,7 +37,7 @@ void executeAirlockCycle() {
   
   Serial.println("Hatch open - detaching servo...");
   delay(1000);
-  hatchServo.detach(); // Important: detach to prevent overheating
+  hatchServo.detach();
 }
 
 void smoothMove(int startAngle, int endAngle, int duration) {
@@ -63,29 +62,4 @@ float easeInOutCubic(float t) {
     float f = 2 * t - 2;
     return 1 + f * f * f / 2;
   }
-}
-
-void calibrateServo() {
-  // Force servo to 180° (open) in small increments to avoid jerking
-  Serial.println("Moving to 180° in stages...");
-  
-  // Go to some middle position first, then sweep up to 180°
-  hatchServo.write(90);
-  delay(1000);
-  
-  // Slowly sweep to 180° to ensure we're actually there
-  for (int angle = 90; angle <= startAngle; angle += 5) {
-    hatchServo.write(angle);
-    Serial.print("Calibrating: ");
-    Serial.print(angle);
-    Serial.println("°");
-    delay(200);
-  }
-  
-  // Final command to ensure we're at exactly 180°
-  hatchServo.write(startAngle);
-  delay(1000);
-  
-  Serial.println("Calibration complete - servo at 180° (open)");
-  delay(500);
 }
