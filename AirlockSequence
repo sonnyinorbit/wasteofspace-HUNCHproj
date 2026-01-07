@@ -1,0 +1,171 @@
+#include <Adafruit_NeoPixel.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Servo.h>
+
+
+// OLED Display Setup
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+
+// NeoPixel Setup
+Adafruit_NeoPixel strip(6, 6, NEO_GRB + NEO_KHZ800);
+
+
+// Servo Setup
+Servo hatchServo;
+const int servoPin = 9;
+const int STOP = 90;
+const int CW = 0;
+const int CCW = 180;
+
+
+// Pins
+const int beamPin = 7;
+const int btnPin = 2;
+
+
+// State
+int lastBtn = LOW;
+bool beamBroken = false;
+bool lastBeam = false;
+
+
+void setup() {
+ Serial.begin(9600);
+  pinMode(beamPin, INPUT);
+ pinMode(btnPin, INPUT);
+  strip.begin();
+ strip.setBrightness(50);
+ for(int i = 0; i < 6; i++) {
+   strip.setPixelColor(i, 0);
+ }
+ strip.show();
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  hatchServo.attach(servoPin);
+ hatchServo.write(STOP);
+ delay(50);
+  // Startup
+ display.clearDisplay();
+ display.setTextSize(2);
+ display.setTextColor(1);
+ display.setCursor(10, 10);
+ display.print(F("AIRLOCK"));
+ display.setCursor(10, 30);
+ display.print(F("SYSTEM"));
+ display.display();
+ delay(2000);
+  Serial.println(F("READY"));
+}
+
+
+void loop() {
+ hatchServo.write(STOP);
+  // Check beam - HIGH = BROKEN, LOW = INTACT
+ pinMode(beamPin, INPUT);
+ delayMicroseconds(10);
+ int beam = digitalRead(beamPin);
+ beamBroken = (beam == HIGH);
+  // Update display/LEDs if state changed
+ if (beamBroken != lastBeam) {
+   if (beamBroken) {
+     // RED + PURPLE
+     for(int i = 0; i < 3; i++) strip.setPixelColor(i, strip.Color(255, 0, 0));
+     for(int i = 3; i < 6; i++) strip.setPixelColor(i, strip.Color(128, 0, 128));
+     strip.show();
+    
+     display.clearDisplay();
+     display.setTextSize(1);
+     display.setCursor(0, 0);
+     display.print(F("DOOR IS OPEN\n\nClose inner hatch\nbefore starting"));
+     display.display();
+   } else {
+     // GREEN + ORANGE
+     for(int i = 0; i < 3; i++) strip.setPixelColor(i, strip.Color(0, 255, 0));
+     for(int i = 3; i < 6; i++) strip.setPixelColor(i, strip.Color(255, 165, 0));
+     strip.show();
+    
+     display.clearDisplay();
+     display.setTextSize(1);
+     display.setCursor(0, 0);
+     display.print(F("READY\n\nSafe to start\nPress button"));
+     display.display();
+   }
+ }
+ lastBeam = beamBroken;
+  // Button check
+ int btn = digitalRead(btnPin);
+ if (!beamBroken && btn == HIGH && lastBtn == LOW) {
+   runCycle();
+ }
+ lastBtn = btn;
+ delay(100);
+}
+
+
+void showPhase(const char* phase, const char* msg, uint32_t color) {
+ display.clearDisplay();
+ display.setTextSize(1);
+ display.setCursor(0, 0);
+ display.print(phase);
+ display.print(F("\n"));
+ display.print(msg);
+ display.print(F("\n\nDo not open"));
+ display.display();
+  for(int i = 0; i < 3; i++) {
+   strip.setPixelColor(i, color);
+ }
+ strip.show();
+}
+
+
+void runCycle() {
+ // PHASE 0 - AIR MOVEMENT - BLUE
+ showPhase("PHASE 0", "MOVING AIR", strip.Color(0, 150, 255));
+ hatchServo.write(STOP);
+ delay(3000);
+  // PHASE 1 - YELLOW - Open hatch
+ showPhase("PHASE 1", "OPENING HATCH", strip.Color(255, 255, 0));
+ hatchServo.write(CCW);
+ delay(560);
+ hatchServo.write(STOP);
+ delay(2440);
+  // PHASE 2 - Disposing
+ showPhase("PHASE 2", "DISPOSING TRASH", strip.Color(255, 255, 0));
+ hatchServo.write(STOP);
+ delay(3000);
+  // PHASE 3 - Close hatch
+ showPhase("PHASE 3", "CLOSING HATCH", strip.Color(255, 255, 0));
+ hatchServo.write(CW);
+ delay(610);
+ hatchServo.write(STOP);
+ delay(2390);
+  // PHASE 4 - DEPRESSURIZING - YELLOW
+ showPhase("PHASE 4", "DEPRESSURIZING", strip.Color(255, 255, 0));
+ hatchServo.write(STOP);
+ delay(3000);
+  // PHASE 5 - DEPRESSURIZED - RED
+ showPhase("PHASE 5", "DEPRESSURIZED", strip.Color(255, 0, 0));
+ delay(3000);
+  // PHASE 6 - REPRESSURIZING - YELLOW
+ showPhase("PHASE 6", "REPRESSURIZING", strip.Color(255, 255, 0));
+ hatchServo.write(STOP);
+ delay(3000);
+  // PHASE 7 - GREEN - COMPLETE
+ display.clearDisplay();
+ display.setTextSize(1);
+ display.setCursor(0, 0);
+ display.print(F("PHASE 7\nCOMPLETE\n\nCycle finished"));
+ display.display();
+ for(int i = 0; i < 3; i++) {
+   strip.setPixelColor(i, strip.Color(0, 255, 0));
+ }
+ strip.show();
+ delay(3000);
+  hatchServo.write(STOP);
+ delay(50);
+}
