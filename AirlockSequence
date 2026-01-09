@@ -4,17 +4,18 @@
 #include <Adafruit_SSD1306.h>
 #include <Servo.h>
 
-
-// OLED Display Setup
+// OLED Display Setup - we'll try both sizes
 #define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+#define SCREEN_HEIGHT 64  // We'll also try 32 if this fails
 #define OLED_RESET -1
+
+// Start with 64 height
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-
 // NeoPixel Setup
-Adafruit_NeoPixel strip(6, 6, NEO_GRB + NEO_KHZ800);
-
+#define NEOPIXEL_PIN 6
+#define NUM_PIXELS 6
+Adafruit_NeoPixel strip(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // Servo Setup
 Servo hatchServo;
@@ -23,149 +24,351 @@ const int STOP = 90;
 const int CW = 0;
 const int CCW = 180;
 
-
 // Pins
 const int beamPin = 7;
 const int btnPin = 2;
-
+const int limitSwitchPin = 4;
 
 // State
 int lastBtn = LOW;
-bool beamBroken = false;
-bool lastBeam = false;
-
+bool trashPresent = false;
+bool lastTrashState = false;
+bool oledWorking = false;
+int oledHeight = 64; // Track which height worked
 
 void setup() {
- Serial.begin(9600);
+  Serial.begin(9600);
+  delay(500);
+  Serial.println(F("Starting initialization..."));
+  
   pinMode(beamPin, INPUT);
- pinMode(btnPin, INPUT);
+  pinMode(btnPin, INPUT);
+  pinMode(limitSwitchPin, INPUT_PULLUP);
+  Serial.println(F("Pins configured"));
+  
+  // Initialize NeoPixels
   strip.begin();
- strip.setBrightness(50);
- for(int i = 0; i < 6; i++) {
-   strip.setPixelColor(i, 0);
- }
- strip.show();
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  strip.setBrightness(50);
+  strip.show();
+  Serial.println(F("NeoPixels initialized"));
+  
+  // Test NeoPixels
+  for(int i = 0; i < NUM_PIXELS; i++) {
+    strip.setPixelColor(i, strip.Color(255, 255, 255));
+  }
+  strip.show();
+  delay(500);
+  setAllLEDs(strip.Color(0, 0, 0));
+  Serial.println(F("NeoPixel test complete"));
+  
+  // Initialize I2C
+  Wire.begin();
+  Wire.setClock(400000L); // Try faster I2C speed
+  delay(100);
+  Serial.println(F("I2C initialized (400kHz)"));
+  
+  // Scan for I2C devices
+  Serial.println(F("Scanning I2C bus..."));
+  byte error, address;
+  int nDevices = 0;
+  
+  for(address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    
+    if (error == 0) {
+      Serial.print(F("I2C device at 0x"));
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      nDevices++;
+    }
+  }
+  
+  Serial.print(F("Found "));
+  Serial.print(nDevices);
+  Serial.println(F(" device(s)"));
+  
+  // Try to initialize OLED - first try 128x64
+  Serial.println(F("Trying 128x64 OLED at 0x3C..."));
+  delay(100);
+  
+  if(display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SUCCESS! 128x64 OLED working"));
+    oledWorking = true;
+    oledHeight = 64;
+  } else {
+    Serial.println(F("128x64 failed, trying 128x32..."));
+    
+    // Try creating a new display object with 32 height
+    Adafruit_SSD1306 display32(SCREEN_WIDTH, 32, &Wire, OLED_RESET);
+    delay(100);
+    
+    if(display32.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+      Serial.println(F("SUCCESS! 128x32 OLED working"));
+      oledWorking = true;
+      oledHeight = 32;
+      display = display32; // Use the 32-height version
+    } else {
+      Serial.println(F("Both sizes failed"));
+      Serial.println(F("Checking possible issues:"));
+      Serial.println(F("1. Is VCC connected to 5V (or 3.3V)?"));
+      Serial.println(F("2. Are SDA/SCL connections solid?"));
+      Serial.println(F("3. Try adding 4.7k pull-up resistors"));
+      Serial.println(F("4. OLED might be damaged"));
+      
+      oledWorking = false;
+      
+      // Flash orange
+      for(int j = 0; j < 5; j++) {
+        setAllLEDs(strip.Color(255, 100, 0));
+        delay(300);
+        setAllLEDs(strip.Color(0, 0, 0));
+        delay(300);
+      }
+    }
+  }
+  
+  // If OLED is working, test it
+  if (oledWorking) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.println(F("OLED TEST"));
+    display.print(F("Size: 128x"));
+    display.println(oledHeight);
+    display.println(F("Working!"));
+    display.display();
+    delay(2000);
+  }
+  
+  // Initialize Servo
   hatchServo.attach(servoPin);
- hatchServo.write(STOP);
- delay(50);
-  // Startup
- display.clearDisplay();
- display.setTextSize(2);
- display.setTextColor(1);
- display.setCursor(10, 10);
- display.print(F("AIRLOCK"));
- display.setCursor(10, 30);
- display.print(F("SYSTEM"));
- display.display();
- delay(2000);
-  Serial.println(F("READY"));
+  hatchServo.write(STOP);
+  delay(50);
+  Serial.println(F("Servo initialized"));
+  
+  if (oledWorking) {
+    // Startup screen
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(WHITE);
+    display.setCursor(5, oledHeight == 32 ? 5 : 10);
+    display.print(F("TRASH"));
+    if (oledHeight == 64) {
+      display.setCursor(5, 30);
+      display.print(F("EJECTOR"));
+    }
+    display.display();
+    delay(2000);
+  }
+  
+  // LEDs pulse
+  for(int i = 0; i < 3; i++) {
+    setAllLEDs(strip.Color(0, 0, 255));
+    delay(300);
+    setAllLEDs(strip.Color(0, 0, 0));
+    delay(300);
+  }
+  
+  Serial.println(F("========================="));
+  Serial.println(F("System Ready!"));
+  Serial.println(F("========================="));
+  updateIdleDisplay();
 }
-
 
 void loop() {
- hatchServo.write(STOP);
-  // Check beam - HIGH = BROKEN, LOW = INTACT
- pinMode(beamPin, INPUT);
- delayMicroseconds(10);
- int beam = digitalRead(beamPin);
- beamBroken = (beam == HIGH);
-  // Update display/LEDs if state changed
- if (beamBroken != lastBeam) {
-   if (beamBroken) {
-     // RED + PURPLE
-     for(int i = 0; i < 3; i++) strip.setPixelColor(i, strip.Color(255, 0, 0));
-     for(int i = 3; i < 6; i++) strip.setPixelColor(i, strip.Color(128, 0, 128));
-     strip.show();
-    
-     display.clearDisplay();
-     display.setTextSize(1);
-     display.setCursor(0, 0);
-     display.print(F("DOOR IS OPEN\n\nClose inner hatch\nbefore starting"));
-     display.display();
-   } else {
-     // GREEN + ORANGE
-     for(int i = 0; i < 3; i++) strip.setPixelColor(i, strip.Color(0, 255, 0));
-     for(int i = 3; i < 6; i++) strip.setPixelColor(i, strip.Color(255, 165, 0));
-     strip.show();
-    
-     display.clearDisplay();
-     display.setTextSize(1);
-     display.setCursor(0, 0);
-     display.print(F("READY\n\nSafe to start\nPress button"));
-     display.display();
-   }
- }
- lastBeam = beamBroken;
-  // Button check
- int btn = digitalRead(btnPin);
- if (!beamBroken && btn == HIGH && lastBtn == LOW) {
-   runCycle();
- }
- lastBtn = btn;
- delay(100);
+  hatchServo.write(STOP);
+  
+  int switchState = digitalRead(limitSwitchPin);
+  bool outerHatchClosed = (switchState == LOW);
+  
+  pinMode(beamPin, INPUT);
+  delayMicroseconds(10);
+  int beam = digitalRead(beamPin);
+  trashPresent = (beam == HIGH);
+  
+  if (millis() % 2000 < 100) {
+    Serial.print(F("Trash: "));
+    Serial.print(trashPresent ? "YES" : "NO");
+    Serial.print(F(" | Hatch: "));
+    Serial.print(outerHatchClosed ? "CLOSED" : "OPEN");
+    Serial.print(F(" | OLED: "));
+    Serial.println(oledWorking ? "OK" : "FAIL");
+  }
+  
+  if (trashPresent != lastTrashState) {
+    updateIdleDisplay();
+  }
+  lastTrashState = trashPresent;
+  
+  int btn = digitalRead(btnPin);
+  if (btn == HIGH && lastBtn == LOW) {
+    Serial.println(F(">>> BUTTON PRESSED <<<"));
+    if (trashPresent) {
+      if (outerHatchClosed) {
+        runCycle();
+      } else {
+        showError("HATCH OPEN", "Close hatch first");
+        delay(3000);
+        updateIdleDisplay();
+      }
+    } else {
+      showError("NO TRASH", "Insert trash");
+      delay(3000);
+      updateIdleDisplay();
+    }
+  }
+  lastBtn = btn;
+  delay(100);
 }
 
+void updateIdleDisplay() {
+  if (trashPresent) {
+    setAllLEDs(strip.Color(0, 255, 255));
+    
+    if (oledWorking) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(WHITE);
+      display.setCursor(0, 0);
+      display.println(F("TRASH DETECTED"));
+      display.println();
+      display.println(F("Ready to eject"));
+      display.println();
+      display.println(F("Press button"));
+      display.display();
+    }
+  } else {
+    setAllLEDs(strip.Color(0, 100, 255));
+    
+    if (oledWorking) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(WHITE);
+      display.setCursor(0, 0);
+      display.println(F("WAITING"));
+      display.println();
+      display.println(F("Insert trash"));
+      display.display();
+    }
+  }
+}
+
+void showError(const char* title, const char* msg) {
+  for(int i = 0; i < 3; i++) {
+    setAllLEDs(strip.Color(255, 0, 0));
+    delay(200);
+    setAllLEDs(strip.Color(0, 0, 0));
+    delay(200);
+  }
+  setAllLEDs(strip.Color(255, 0, 0));
+  
+  if (oledWorking) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.println(F("ERROR"));
+    display.println();
+    display.println(title);
+    display.println();
+    display.println(msg);
+    display.display();
+  }
+}
 
 void showPhase(const char* phase, const char* msg, uint32_t color) {
- display.clearDisplay();
- display.setTextSize(1);
- display.setCursor(0, 0);
- display.print(phase);
- display.print(F("\n"));
- display.print(msg);
- display.print(F("\n\nDo not open"));
- display.display();
-  for(int i = 0; i < 3; i++) {
-   strip.setPixelColor(i, color);
- }
- strip.show();
+  setAllLEDs(color);
+  
+  if (oledWorking) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.println(phase);
+    display.println();
+    display.println(msg);
+    if (oledHeight == 64) {
+      display.println();
+      display.println(F("** DO NOT OPEN **"));
+      display.println(F("** INNER HATCH **"));
+    }
+    display.display();
+  }
 }
 
+void setAllLEDs(uint32_t color) {
+  for(int i = 0; i < NUM_PIXELS; i++) {
+    strip.setPixelColor(i, color);
+  }
+  strip.show();
+}
 
 void runCycle() {
- // PHASE 0 - AIR MOVEMENT - BLUE
- showPhase("PHASE 0", "MOVING AIR", strip.Color(0, 150, 255));
- hatchServo.write(STOP);
- delay(3000);
-  // PHASE 1 - YELLOW - Open hatch
- showPhase("PHASE 1", "OPENING HATCH", strip.Color(255, 255, 0));
- hatchServo.write(CCW);
- delay(560);
- hatchServo.write(STOP);
- delay(2440);
-  // PHASE 2 - Disposing
- showPhase("PHASE 2", "DISPOSING TRASH", strip.Color(255, 255, 0));
- hatchServo.write(STOP);
- delay(3000);
-  // PHASE 3 - Close hatch
- showPhase("PHASE 3", "CLOSING HATCH", strip.Color(255, 255, 0));
- hatchServo.write(CW);
- delay(610);
- hatchServo.write(STOP);
- delay(2390);
-  // PHASE 4 - DEPRESSURIZING - YELLOW
- showPhase("PHASE 4", "DEPRESSURIZING", strip.Color(255, 255, 0));
- hatchServo.write(STOP);
- delay(3000);
-  // PHASE 5 - DEPRESSURIZED - RED
- showPhase("PHASE 5", "DEPRESSURIZED", strip.Color(255, 0, 0));
- delay(3000);
-  // PHASE 6 - REPRESSURIZING - YELLOW
- showPhase("PHASE 6", "REPRESSURIZING", strip.Color(255, 255, 0));
- hatchServo.write(STOP);
- delay(3000);
-  // PHASE 7 - GREEN - COMPLETE
- display.clearDisplay();
- display.setTextSize(1);
- display.setCursor(0, 0);
- display.print(F("PHASE 7\nCOMPLETE\n\nCycle finished"));
- display.display();
- for(int i = 0; i < 3; i++) {
-   strip.setPixelColor(i, strip.Color(0, 255, 0));
- }
- strip.show();
- delay(3000);
+  Serial.println(F("START CYCLE"));
+  
+  showPhase("PHASE 1", "DEPRESSURIZING\nRemoving air...", strip.Color(255, 165, 0));
+  delay(8000);
+  
+  showPhase("PHASE 2", "OPENING HATCH\nStand clear...", strip.Color(255, 255, 0));
+  hatchServo.write(CCW);
+  delay(560);
   hatchServo.write(STOP);
- delay(50);
+  delay(7440);
+  
+  showPhase("PHASE 3", "EJECTING TRASH", strip.Color(255, 100, 0));
+  delay(6250);
+  
+  pinMode(beamPin, INPUT);
+  delayMicroseconds(10);
+  bool stillPresent = (digitalRead(beamPin) == HIGH);
+  
+  if (stillPresent) {
+    showError("EJECT FAILED", "Trash present");
+    delay(5000);
+  }
+  
+  showPhase("PHASE 4", "CLOSING HATCH", strip.Color(255, 255, 0));
+  hatchServo.write(CW);
+  delay(610);
+  hatchServo.write(STOP);
+  delay(7390);
+  
+  int timeout = 0;
+  while(digitalRead(limitSwitchPin) != LOW && timeout < 50) {
+    delay(100);
+    timeout++;
+  }
+  
+  if (digitalRead(limitSwitchPin) != LOW) {
+    showError("HATCH ERROR", "Not closed");
+    delay(5000);
+  }
+  
+  showPhase("PHASE 5", "REPRESSURIZING\nRestoring air...", strip.Color(0, 255, 255));
+  delay(8000);
+  
+  setAllLEDs(strip.Color(0, 255, 0));
+  
+  if (oledWorking) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.println(F("COMPLETE"));
+    display.println();
+    display.println(F("Trash ejected"));
+    display.println();
+    display.println(F("Safe to open"));
+    display.display();
+  }
+  
+  delay(5000);
+  hatchServo.write(STOP);
+  
+  delay(1000);
+  trashPresent = false;
+  lastTrashState = false;
+  updateIdleDisplay();
 }
