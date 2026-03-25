@@ -1,681 +1,353 @@
-#include <Adafruit_NeoPixel.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_NeoPixel.h>
 #include <Servo.h>
-#include <Adafruit_VL53L1X.h>
 #include <Stepper.h>
 
-
-// =====================
-// Hardware Configuration
-// =====================
-
-
-// Stepper
-#define STEPS_PER_REV 400
-Stepper stepper(STEPS_PER_REV, 9, 10, 11, 12);
-const int STEPPER_RPM = 30;
-
-
-// OLED 128x32
+// ================= OLED =================
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 32
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-const uint8_t OLED_ADDR = 0x3C;
-
-
-// NeoPixels
-const int NEOPIXEL_PIN = 6;
-const int NUM_PIXELS = 6;
-Adafruit_NeoPixel strip(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
-const uint8_t LED_BRIGHTNESS = 50;
-
-
-// ToF
-Adafruit_VL53L1X vl53 = Adafruit_VL53L1X();
-const uint8_t TOF_ADDR = 0x29;
-const uint16_t TOF_TIMING_BUDGET_MS = 50;
-
-
-// Servo
-Servo hatchServo;
-const int SERVO_PIN = 8;
-const int SERVO_STOP = 90;
-const int SERVO_CW   = 0;
-const int SERVO_CCW  = 180;
-
-
-// IO Pins
-const int BTN_PIN = 2;
-const int LIMIT_SWITCH_PIN = 4; // INPUT_PULLUP, LOW = closed
-
-
-// Distance thresholds (mm)
-const int EMPTY_DISTANCE_MM = 90;
-const int CAN_PRESENT_THRESHOLD_MM = 60;
-
-
-// Filtering
-const int NUM_READINGS = 5;
-int distanceReadings[NUM_READINGS];
-int distanceIndex = 0;
-
-
-// =====================
-// State
-// =====================
-int lastBtn = LOW;
-
-
 bool oledWorking = false;
-bool tofWorking  = false;
 
+// ================= PINS =================
+const int NEOPIXEL_PIN     = 2;
+const int LIMIT_SWITCH_PIN = 3;  // INPUT_PULLUP, pressed/closed = LOW
+const int BUTTON_PIN       = 4;  // pressed = HIGH (your wiring)
+const int SERVO_PIN        = 5;
 
-bool trashPresent = false;
-bool lastTrashState = false;
+// Stepper pins
+const int STEPPER_PIN_1 = 9;
+const int STEPPER_PIN_2 = 10;
+const int STEPPER_PIN_3 = 11;
+const int STEPPER_PIN_4 = 12;
 
+// ================= NEOPIXEL =================
+const int NUM_PIXELS = 11;
+Adafruit_NeoPixel strip(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
-bool cycleAborted = false;
+// ================= SERVO =================
+Servo hatchServo;
+const int CLOSED_ANGLE = 80;
+const int OPEN_ANGLE   = 180;
+const unsigned long SERVO_SETTLE_MS = 600;
 
+// ================= STEPPER =================
+const int MOTOR_STEPS_PER_REV = 200;
+Stepper ejectStepper(200, 9, 10, 11, 12);
+const int STEPPER_RPM = 30;
 
-// =====================
-// Colors (NeoPixel uses GRB order internally)
-// =====================
-inline uint32_t C(uint8_t r, uint8_t g, uint8_t b) { return strip.Color(r, g, b); }
-const uint32_t LED_OFF     = 0;
-const uint32_t LED_WAITING = /*blue*/ 0; // set in setup after strip.begin
-const uint32_t LED_READY   = /*cyan*/ 0; // set in setup after strip.begin
-const uint32_t LED_OK      = /*green*/ 0; // set in setup after strip.begin
-const uint32_t LED_ERR     = /*red*/ 0; // set in setup after strip.begin
+// Your ~360° eject output (with 125:1) -> ~25000 motor steps (as you’ve been using)
+const long EJECT_STEPS = 25000;
 
+// ================= TIMING =================
+const unsigned long T_DEPRESSURIZE = 2000;
+const unsigned long T_OPEN_HATCH   = 2000;
+const unsigned long T_EJECT_PAUSE  = 1000;
+const unsigned long T_CLOSE_HATCH  = 2000;
+const unsigned long T_REPRESSURIZE = 8000;
 
-// =====================
-// Cycle Timings (ms)
-// =====================
-const unsigned long T_DEPRESSURIZE = 2750;
-const unsigned long T_OPEN_PULSE   = 560;
-const unsigned long T_OPEN_WAIT    = 7440;
-const unsigned long T_EJECT_WAIT   = 560;
-const unsigned long T_CLOSE_PULSE  = 610;
-const unsigned long T_CLOSE_WAIT   = 2000;
-const unsigned long T_REPRESSURIZE = 2750;
+// ================= BUTTON DEBOUNCE / EDGE =================
+int btnStable = LOW;
+int btnLastReading = LOW;
+unsigned long btnLastChangeMs = 0;
+const unsigned long DEBOUNCE_MS = 35;
 
+bool btnRisingEdge = false; // set true for ONE loop tick when a clean rising edge happens
 
-// =====================
-// Forward Decls
-// =====================
-void initPins();
-void initDistanceBuffer();
-void initNeoPixels();
-void initI2C();
-void initServo();
-void initOLED();
-void initToF();
+void updateButton() {
+int reading = digitalRead(BUTTON_PIN);
 
-
-void setAllLEDs(uint32_t color);
-void pulseLED(uint32_t color, int times, unsigned long onMs, unsigned long offMs);
-
-
-void oledSplash();
-void oledIdle();
-void oledError(const __FlashStringHelper* title, const __FlashStringHelper* msg);
-void oledPhase(const __FlashStringHelper* phase, const __FlashStringHelper* msg);
-
-
-bool isInnerHatchClosed();
-bool readButtonPressedEdge();
-bool canStartCycle();
-
-
-bool checkForCanFiltered();
-int  getAveragedDistanceMM(); // returns -1 if no fresh reading
-
-
-bool checkLimitSwitchAbort();        // true = ok, false = aborted
-bool safeDelay(unsigned long ms);    // monitors limit switch during wait
-
-
-void runCycle();
-void runEjection();
-
-
-// Optional: faster “refresh can state” helper used post-eject
-void resetDistanceFilterToEmpty();
-void primeDistanceFilter(int samples, unsigned long spacingMs);
-
-
-// =====================
-// Setup / Loop
-// =====================
-void setup() {
- // Serial removed (as requested)
- delay(200);
-
-
- initPins();
- initDistanceBuffer();
-
-
- initNeoPixels();
- initI2C();
-
-
- initToF();
- initOLED();
- initServo();
-
-
- if (oledWorking) oledSplash();
-
-
- // Ready pulse
- pulseLED(C(0, 0, 255), 3, 250, 250); // blue pulse
-
-
- oledIdle();
+if (reading != btnLastReading) {
+ btnLastChangeMs = millis();
+ btnLastReading = reading;
 }
 
-
-void loop() {
- hatchServo.write(SERVO_STOP);
-
-
- // Update sensors/state
- if (tofWorking) {
-   trashPresent = checkForCanFiltered();
- } else {
-   trashPresent = false;
- }
-
-
- // Update idle UI only on state change
- if (trashPresent != lastTrashState) {
-   oledIdle();
-   lastTrashState = trashPresent;
- }
-
-
- // Button edge -> attempt cycle
- if (readButtonPressedEdge()) {
-   if (!canStartCycle()) {
-     // canStartCycle already shows the correct error + returns to idle
-   } else {
-     runCycle();
+// if stable long enough, accept new state
+if ((millis() - btnLastChangeMs) > DEBOUNCE_MS) {
+ if (btnStable != reading) {
+   btnStable = reading;
+   if (btnStable == HIGH) {
+     btnRisingEdge = true; // latch a clean press
    }
  }
-
-
- delay(30);
+}
 }
 
-
-// =====================
-// Init Helpers
-// =====================
-void initPins() {
- pinMode(BTN_PIN, INPUT);
- pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+bool consumeButtonPress() {
+if (btnRisingEdge) {
+ btnRisingEdge = false;
+ return true;
+}
+return false;
 }
 
-
-void initDistanceBuffer() {
- for (int i = 0; i < NUM_READINGS; i++) distanceReadings[i] = EMPTY_DISTANCE_MM;
- distanceIndex = 0;
+// ================= HELPERS =================
+bool hatchClosed() {
+// INPUT_PULLUP => pressed/closed == LOW
+return digitalRead(LIMIT_SWITCH_PIN) == LOW;
 }
 
-
-void initNeoPixels() {
- strip.begin();
- strip.setBrightness(LED_BRIGHTNESS);
- strip.show();
-
-
- // quick white test
- setAllLEDs(C(255, 255, 255));
- delay(250);
- setAllLEDs(LED_OFF);
-
-
- // assign const “colors” that depend on strip.Color()
- // (keeps them in one place, avoids global init order problems)
- // NOTE: we’ll just call C(...) directly elsewhere, but keeping these is fine.
-}
-
-
-void initI2C() {
- Wire.begin();
- Wire.setClock(400000L);
- delay(50);
-}
-
-
-void initServo() {
- hatchServo.attach(SERVO_PIN);
- hatchServo.write(SERVO_STOP);
- delay(50);
-}
-
-
-void initOLED() {
- delay(50);
- oledWorking = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
- if (!oledWorking) {
-   // orange-ish flash to indicate OLED fail
-   pulseLED(C(255, 100, 0), 5, 180, 180);
- }
-}
-
-
-void initToF() {
- tofWorking = false;
-
-
- if (!vl53.begin(TOF_ADDR, &Wire)) {
-   pulseLED(C(255, 0, 0), 5, 200, 200); // red flash: sensor missing
-   tofWorking = false;
-   return;
- }
-
-
- if (!vl53.startRanging()) {
-   pulseLED(C(255, 0, 0), 5, 200, 200); // red flash: ranging failed
-   tofWorking = false;
-   return;
- }
-
-
- vl53.setTimingBudget(TOF_TIMING_BUDGET_MS);
- tofWorking = true;
-}
-
-
-// =====================
-// UI Helpers
-// =====================
 void setAllLEDs(uint32_t color) {
- for (int i = 0; i < NUM_PIXELS; i++) strip.setPixelColor(i, color);
+for (int i = 0; i < NUM_PIXELS; i++) strip.setPixelColor(i, color);
+strip.show();
+}
+
+uint32_t wheel(byte pos) {
+pos = 255 - pos;
+if (pos < 85)   return strip.Color(255 - pos * 3, 0, pos * 3);
+if (pos < 170)  { pos -= 85;  return strip.Color(0, pos * 3, 255 - pos * 3); }
+pos -= 170;
+return strip.Color(pos * 3, 255 - pos * 3, 0);
+}
+
+void rainbowFor(unsigned long ms, int waitMs = 12) {
+unsigned long start = millis();
+byte j = 0;
+while (millis() - start < ms) {
+ for (int i = 0; i < NUM_PIXELS; i++) {
+   strip.setPixelColor(i, wheel((j + i * (256 / NUM_PIXELS)) & 255));
+ }
  strip.show();
+ j++;
+ delay(waitMs);
+}
 }
 
-
-void pulseLED(uint32_t color, int times, unsigned long onMs, unsigned long offMs) {
- for (int i = 0; i < times; i++) {
-   setAllLEDs(color);
-   delay(onMs);
-   setAllLEDs(LED_OFF);
-   delay(offMs);
- }
+void showText(const char* line1, const char* line2 = nullptr, const char* line3 = nullptr) {
+if (!oledWorking) return;
+display.clearDisplay();
+display.setTextSize(1);
+display.setTextColor(WHITE);
+display.setCursor(0, 0);
+if (line1) display.println(line1);
+if (line2) display.println(line2);
+if (line3) display.println(line3);
+display.display();
 }
 
-
-void oledSplash() {
- display.clearDisplay();
- display.setTextColor(WHITE);
-
-
- display.setTextSize(2);
- display.setCursor(10, 8);
- display.print(F("TRASH"));
- display.display();
- delay(700);
-
-
- display.clearDisplay();
- display.setCursor(5, 8);
- display.print(F("EJECTOR"));
- display.display();
- delay(700);
-
-
- display.setTextSize(1);
+// Abort rules DURING cycle:
+// - hatch opened (limit not pressed) OR
+// - user presses button again (a NEW press)
+bool abortRequestedDuringCycle() {
+if (!hatchClosed()) return true;
+if (consumeButtonPress()) return true;
+return false;
 }
 
-
-void oledIdle() {
- if (trashPresent) {
-   setAllLEDs(C(0, 255, 255)); // cyan: ready
-   if (!oledWorking) return;
-
-
-   display.clearDisplay();
-   display.setTextSize(1);
-   display.setTextColor(WHITE);
-   display.setCursor(0, 0);
-   display.println(F("TRASH DETECTED"));
-   display.println(F("Ready to eject"));
-   display.println(F("Press button"));
-   display.display();
- } else {
-   setAllLEDs(C(0, 100, 255)); // blue: waiting
-   if (!oledWorking) return;
-
-
-   display.clearDisplay();
-   display.setTextSize(1);
-   display.setTextColor(WHITE);
-   display.setCursor(0, 0);
-   display.println(F("WAITING"));
-   display.println(F("Insert trash"));
-   display.display();
- }
-}
-
-
-void oledError(const __FlashStringHelper* title, const __FlashStringHelper* msg) {
- pulseLED(C(255, 0, 0), 3, 160, 160);
- setAllLEDs(C(255, 0, 0));
-
-
- if (!oledWorking) return;
-
-
- display.clearDisplay();
- display.setTextSize(1);
- display.setTextColor(WHITE);
- display.setCursor(0, 0);
- display.println(F("ERROR"));
- display.println(title);
- display.println(msg);
- display.display();
-}
-
-
-void oledPhase(const __FlashStringHelper* phase, const __FlashStringHelper* msg) {
- if (!oledWorking) return;
-
-
- display.clearDisplay();
- display.setTextSize(1);
- display.setTextColor(WHITE);
- display.setCursor(0, 0);
- display.println(phase);
- display.println(msg);
- display.println(F("DO NOT OPEN HATCH"));
- display.display();
-}
-
-
-// =====================
-// Input / Sensor Helpers
-// =====================
-bool isInnerHatchClosed() {
- // limit switch wired to pullup: pressed/closed -> LOW
- return digitalRead(LIMIT_SWITCH_PIN) == LOW;
-}
-
-
-bool readButtonPressedEdge() {
- int btn = digitalRead(BTN_PIN);
- bool pressedEdge = (btn == HIGH && lastBtn == LOW);
- lastBtn = btn;
-
-
- if (!pressedEdge) return false;
-
-
- // debounce confirm
- delay(40);
- return digitalRead(BTN_PIN) == HIGH;
-}
-
-
-int getAveragedDistanceMM() {
- if (!tofWorking) return -1;
- if (!vl53.dataReady()) return -1;
-
-
- int16_t d = vl53.distance();
- vl53.clearInterrupt();
-
-
- if (d == -1) return -1;
-
-
- distanceReadings[distanceIndex] = d;
- distanceIndex = (distanceIndex + 1) % NUM_READINGS;
-
-
- long sum = 0;
- for (int i = 0; i < NUM_READINGS; i++) sum += distanceReadings[i];
- return (int)(sum / NUM_READINGS);
-}
-
-
-bool checkForCanFiltered() {
- int avg = getAveragedDistanceMM();
- if (avg == -1) return trashPresent; // keep last known state
- return (avg < CAN_PRESENT_THRESHOLD_MM);
-}
-
-
-void resetDistanceFilterToEmpty() {
- for (int i = 0; i < NUM_READINGS; i++) distanceReadings[i] = EMPTY_DISTANCE_MM;
- distanceIndex = 0;
-}
-
-
-void primeDistanceFilter(int samples, unsigned long spacingMs) {
- for (int i = 0; i < samples; i++) {
-   (void)checkForCanFiltered();
-   delay(spacingMs);
- }
-}
-
-
-// =====================
-// Safety Helpers
-// =====================
-bool checkLimitSwitchAbort() {
- if (isInnerHatchClosed()) return true;
-
-
- cycleAborted = true;
-
-
- // emergency stop servo
- hatchServo.write(SERVO_STOP);
-
-
- oledError(F("CYCLE ABORTED"), F("Hatch opened!"));
- delay(2000);
-
-
- oledIdle();
- return false;
-}
-
-
+// Delay that keeps checking abort + button debounce
 bool safeDelay(unsigned long ms) {
+unsigned long start = millis();
+while (millis() - start < ms) {
+ updateButton();
+ if (abortRequestedDuringCycle()) return false;
+ delay(10);
+}
+return true;
+}
+// Chunked stepping so we can check abort in between
+bool safeStepperMove(long steps) {
+const int CHUNK = 50; // smaller chunk = more responsive abort
+long remaining = steps;
+
+while (remaining > 0) {
+ updateButton();
+ if (abortRequestedDuringCycle()) return false;
+
+ int thisChunk = (remaining > CHUNK) ? CHUNK : (int)remaining;
+ ejectStepper.step(thisChunk);
+ remaining -= thisChunk;
+}
+return true;
+}
+
+// ================= IDLE (READY) ANIMATION =================
+unsigned long idleLastUiMs = 0;
+unsigned long idleLastLedMs = 0;
+bool idleFlip = false;
+byte idleRainbowJ = 0;
+
+void idleTick() {
+// LED idle animation
+if (millis() - idleLastLedMs > 35) {
+ idleLastLedMs = millis();
+
+ if (!hatchClosed()) {
+   // warning: orange/red pulse-ish
+   byte b = (byte)( (millis() / 6) % 255 );
+   uint32_t c = strip.Color(255, (b < 128 ? 80 : 20), 0);
+   setAllLEDs(c);
+ } else {
+   // ready: subtle moving blue-cyan gradient
+   for (int i = 0; i < NUM_PIXELS; i++) {
+     // mix a little rainbow wheel but keep it "cool"
+     uint32_t w = wheel((idleRainbowJ + i * (256 / NUM_PIXELS)) & 255);
+     // "cool it down" by zeroing red a bit
+     uint8_t r = (uint8_t)(w >> 16);
+     uint8_t g = (uint8_t)(w >> 8);
+     uint8_t b = (uint8_t)(w);
+     r = r / 6;           // reduce red a lot
+     g = (g * 2) / 3;     // moderate green
+     // keep blue
+     strip.setPixelColor(i, strip.Color(r, g, b));
+   }
+   strip.show();
+   idleRainbowJ++;
+ }
+}
+
+// OLED idle “cycle”
+if (millis() - idleLastUiMs > 700) {
+ idleLastUiMs = millis();
+ idleFlip = !idleFlip;
+
+ if (!hatchClosed()) {
+   showText("CLOSE HATCH", "Limit not pressed", "Then press button");
+ } else {
+   if (idleFlip) showText("READY", "Press button to eject", "");
+   else          showText("READY", "Hatch closed OK", "Waiting...");
+ }
+}
+}
+// ================= CYCLE UI =================
+void abortCycleUI() {
+setAllLEDs(strip.Color(255, 0, 0));
+showText("CYCLE ABORTED", "Hatch opened or", "button pressed");
+delay(1200);
+}
+// One-shot startup splash
+void startupSplash() {
+if (oledWorking) {
+ display.clearDisplay();
+ display.setTextSize(2);
+ display.setTextColor(WHITE);
+ display.setCursor(10, 8);
+ display.print("TRASH");
+ display.display();
+ rainbowFor(900);
+
+ display.clearDisplay();
+ display.setTextSize(2);
+ display.setCursor(5, 8);
+ display.print("EJECTOR");
+ display.display();
+ rainbowFor(900);
+} else {
+ rainbowFor(1200);
+}
+}
+
+// ================= MAIN CYCLE =================
+void runCycle() {
+if (!hatchClosed()) return;
+
+// Clear any “start press” so holding it doesn’t abort immediately
+btnRisingEdge = false;
+delay(50);
+
+// PHASE 1
+setAllLEDs(strip.Color(255, 165, 0));
+showText("PHASE 1", "DEPRESSURIZING", "Do not open hatch");
+if (!safeDelay(T_DEPRESSURIZE)) { abortCycleUI(); return; }
+
+// PHASE 2 - OPEN
+setAllLEDs(strip.Color(255, 255, 0));
+showText("PHASE 2", "OPENING HATCH", "Do not open hatch");
+hatchServo.write(OPEN_ANGLE);
+if (!safeDelay(SERVO_SETTLE_MS)) { abortCycleUI(); return; }
+if (!safeDelay(T_OPEN_HATCH))    { abortCycleUI(); return; }
+
+// PHASE 3 - EJECT
+setAllLEDs(strip.Color(255, 120, 0));
+showText("PHASE 3", "EJECTING TRASH", "Do not open hatch");
+{
+ unsigned long ejectStart = millis();
+ while (millis() - ejectStart < 15000) {
+   updateButton();
+   if (!hatchClosed()) { abortCycleUI(); return; }
+   if (consumeButtonPress()) { abortCycleUI(); return; }
+   ejectStepper.step(10);
+ }
+}
+if (!safeDelay(T_EJECT_PAUSE)) { abortCycleUI(); return; }
+
+delay(1000);
+// PHASE 4 - CLOSE
+setAllLEDs(strip.Color(255, 255, 0));
+showText("PHASE 4", "CLOSING HATCH", "");
+hatchServo.write(CLOSED_ANGLE);
+if (!safeDelayButtonOnly(SERVO_SETTLE_MS)) { abortCycleUI(); return; }
+if (!safeDelayButtonOnly(T_CLOSE_HATCH))   { abortCycleUI(); return; }
+
+delay(2000);
+// PHASE 5
+setAllLEDs(strip.Color(0, 255, 255));
+showText("PHASE 5", "REPRESSURIZING", "");
+if (!safeDelayButtonOnly(T_DEPRESSURIZE)) { abortCycleUI(); return; }
+delay(2000);
+
+// COMPLETE
+setAllLEDs(strip.Color(0, 255, 0));
+showText("CYCLE COMPLETE", "Safe to open", "");
+delay(2000);
+}
+
+bool safeDelayButtonOnly(unsigned long ms) {
  unsigned long start = millis();
  while (millis() - start < ms) {
-   if (!checkLimitSwitchAbort()) return false;
+   updateButton();
+   if (consumeButtonPress()) {
+     Serial.println("ABORT: button in safeDelayButtonOnly");
+     return false;
+   }
    delay(10);
  }
  return true;
 }
 
+// ================= SETUP/LOOP =================
+void setup() {
+ Serial.begin(9600);
+pinMode(BUTTON_PIN, INPUT);              // pressed = HIGH (external wiring)
+pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP); // pressed = LOW
 
-// =====================
-// Cycle Logic
-// =====================
-bool canStartCycle() {
- if (!tofWorking) {
-   oledError(F("SENSOR ERROR"), F("ToF not working"));
-   delay(2000);
-   oledIdle();
-   return false;
- }
+strip.begin();
+strip.setBrightness(60);
+strip.show();
 
+Wire.begin();
+Wire.setClock(400000L);
 
- if (!trashPresent) {
-   oledError(F("NO TRASH"), F("Insert trash"));
-   delay(2000);
-   oledIdle();
-   return false;
- }
+oledWorking = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 
+hatchServo.attach(SERVO_PIN);
+hatchServo.write(CLOSED_ANGLE);
 
- if (!isInnerHatchClosed()) {
-   oledError(F("HATCH OPEN"), F("Close inner hatch"));
-   delay(2000);
-   oledIdle();
-   return false;
- }
+ejectStepper.setSpeed(STEPPER_RPM);
 
+// Initialize button state cleanly
+btnLastReading = digitalRead(BUTTON_PIN);
+btnStable = btnLastReading;
+btnLastChangeMs = millis();
+btnRisingEdge = false;
 
- return true;
+startupSplash();
 }
 
+void loop() {
+updateButton();
 
-void runEjection() {
- const unsigned long EJECTION_DURATION_MS = 60000;
+// Always run READY animation
+idleTick();
 
-
- stepper.setSpeed(STEPPER_RPM);
-
-
- unsigned long start = millis();
- const int CHUNK_STEPS = 10;   // smaller = more responsive
- const int CHUNK_DELAY = 2;    // keep tiny; can be 0
-
-
- while (millis() - start < EJECTION_DURATION_MS) {
-   // safety abort if hatch opened mid-cycle
-   if (!checkLimitSwitchAbort()) return;
-
-
-   // run the stepper in small chunks for the full 60 seconds
-   stepper.step(1125000);
-   delay(CHUNK_DELAY);
+// Start cycle only on a clean press AND hatch closed
+if (consumeButtonPress()) {
+ if (hatchClosed()) {
+   runCycle();
  }
 }
 
-
-
-
-void runCycle() {
- cycleAborted = false;
-
-
- // final safety gate
- if (!checkLimitSwitchAbort()) return;
- if (!trashPresent) {
-   oledError(F("NO TRASH"), F("Can not detected"));
-   delay(2000);
-   oledIdle();
-   return;
- }
-
-
- // PHASE 1 - Depressurize
- setAllLEDs(C(255, 165, 0)); // orange
- oledPhase(F("PHASE 1"), F("DEPRESSURIZING"));
- if (!safeDelay(T_DEPRESSURIZE)) return;
-
-
- // PHASE 2 - Opening hatch
- setAllLEDs(C(255, 255, 0)); // yellow
- oledPhase(F("PHASE 2"), F("OPENING HATCH"));
-
-
- hatchServo.write(SERVO_CCW);
- if (!safeDelay(T_OPEN_PULSE)) { hatchServo.write(SERVO_STOP); return; }
- hatchServo.write(SERVO_STOP);
-
-
- if (!safeDelay(T_OPEN_WAIT)) return;
-
-
- // PHASE 3 - Eject
- setAllLEDs(C(255, 100, 0)); // orange-red
- oledPhase(F("PHASE 3"), F("EJECTING TRASH"));
-
-
- runEjection();
- if (!safeDelay(T_EJECT_WAIT)) return;
-
-
- // Post-eject check (refresh filter & re-check)
- if (!safeDelay(250)) return;
-
-
- bool canStillPresent = false;
- if (tofWorking) {
-   resetDistanceFilterToEmpty();
-   primeDistanceFilter(NUM_READINGS * 2, 80);
-   canStillPresent = checkForCanFiltered();
-
-
-   if (canStillPresent) {
-     oledError(F("EJECT FAILED"), F("Can still there"));
-     if (!safeDelay(1500)) return;
-     // still proceed to close hatch for safety
-   }
- }
-
-
- // PHASE 4 - Close hatch
- setAllLEDs(C(255, 255, 0)); // yellow
- oledPhase(F("PHASE 4"), F("CLOSING HATCH"));
-
-
- hatchServo.write(SERVO_CW);
- if (!safeDelay(T_CLOSE_PULSE)) { hatchServo.write(SERVO_STOP); return; }
- hatchServo.write(SERVO_STOP);
-
-
- if (!safeDelay(T_CLOSE_WAIT)) return;
-
-
- // Verify hatch is closed (with timeout)
- int tries = 0;
- while (!isInnerHatchClosed() && tries < 50) {
-   if (!safeDelay(100)) return;
-   tries++;
- }
-
-
- if (!isInnerHatchClosed()) {
-   oledError(F("HATCH ERROR"), F("Not closed"));
-   delay(2500);
-   oledIdle();
-   return;
- }
-
-
- // PHASE 5 - Repressurize
- setAllLEDs(C(0, 255, 255)); // cyan
- oledPhase(F("PHASE 5"), F("REPRESSURIZING"));
- if (!safeDelay(T_REPRESSURIZE)) return;
-
-
- // COMPLETE
- setAllLEDs(C(0, 255, 0)); // green
- if (oledWorking) {
-   display.clearDisplay();
-   display.setTextSize(1);
-   display.setTextColor(WHITE);
-   display.setCursor(0, 0);
-   display.println(F("CYCLE COMPLETE"));
-   display.println(F("Trash ejected"));
-   display.println(F("Safe to open"));
-   display.display();
- }
-
-
- delay(2500);
- hatchServo.write(SERVO_STOP);
-
-
- // Reset state for next cycle
- resetDistanceFilterToEmpty();
- trashPresent = false;
- lastTrashState = false;
- oledIdle();
+delay(5);
 }
-
-
-
